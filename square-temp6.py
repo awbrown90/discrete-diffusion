@@ -300,7 +300,7 @@ def run(max_steps=100000,lr=1e-4,seed=0):
 
             current_state = new_state
 
-            T=5
+            T=8
             if len(buffer) >= 8*T and learning:
                 examples = buffer.sample(8,T)
 
