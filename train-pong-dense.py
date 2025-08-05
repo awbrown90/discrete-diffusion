@@ -1,10 +1,11 @@
-import random
-import cv2
-import torch
-import numpy as np
+import math, random
+from tqdm import trange
 import torch
 import torch.nn as nn
-from einops import rearrange
+from vae import VAE
+import numpy as np
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, IterableDataset
 
 class PongEnv:
     def __init__(self,
@@ -122,32 +123,71 @@ class PongEnv:
     def get_misses(self):
         return self.miss_counter
 
-def test_render_loop():
-    dev = torch.device('cpu')
-    env = PongEnv(dev, random_miss=False)
+class PongDataset(IterableDataset):
+    def __init__(self, steps_per_epoch=10000):
+        super().__init__()
+        # now `device` is its own parameter
+        self.env   = PongEnv(device=torch.device("cpu"), random_miss=True)
+        self.steps = steps_per_epoch
 
-    cv2.namedWindow('pong', cv2.WINDOW_NORMAL)
-    while True:
-        # get the image tensor (3×H×W), convert to H×W×3 numpy
-        img_t = env.getState() # torch.Size([3, 100, 140])
-        from vae import VAE
-        vae = VAE()
-        x = img_t.unsqueeze(0)
-        y,_,_ = vae(x)
-        pix = ((y + 1) * 127.5).clamp(0,255).round().to(torch.uint8).squeeze()
-        #img = pix.permute(1,2,0).cpu().numpy()         # H×W×3
-        img = img_t.permute(1,2,0).cpu().numpy()         # H×W×3
+    def __iter__(self):
+        for _ in range(self.steps):
+            action = random.choice([0,1])
+            img = self.env.step(action)       # already on the right device
+            yield img
 
-        cv2.imshow('pong', img)
-        key = cv2.waitKey(200) & 0xFF                     # 200 ms per frame
-        if key == 27:                                      # ESC to quit
-            break
+def train_vae(device):
+    # 1) hyper-parameters
+    batch_size   = 32
+    lr           = 3e-4
+    n_epochs     = 50
+    recon_weight = 1.0      # weight for MSE loss
+    vq_weight    = 1.0      # weight for VQ loss
 
-        # randomly move the paddle up/down
-        action = random.choice([0,1])
-        env.step(action)
+    # 2) data loader
+    dataset = PongDataset(steps_per_epoch=2000)
+    loader  = DataLoader(dataset, batch_size=batch_size, num_workers=2)
 
-    cv2.destroyAllWindows()
+    # 3) model, optimizer
+    vae = VAE().to(device)
+    opt = torch.optim.Adam(vae.parameters(), lr=lr)
 
-if __name__ == '__main__':
-    test_render_loop()
+    # 4) training loop
+    for epoch in range(1, n_epochs+1):
+        epoch_recon, epoch_vq, epoch_total = 0.0, 0.0, 0.0
+        num_batches = 0
+        for img_cpu in loader:
+            # x: [B,3,H,W], floats in [0,1]
+            # map to [–1,1] as your encode() expects
+            x = img_cpu.to(device, non_blocking=True).float() / 255.0
+            x_in = 2*(x - 0.5)
+
+            # forward pass
+            recon, vq_loss, _ = vae(x_in)
+            # recon: [B,3,H,W], in [–1,1] via Tanh
+
+            # 5) compute losses
+            recon_loss = F.mse_loss(recon, x_in)
+            loss       = recon_weight * recon_loss + vq_weight * vq_loss
+
+            # 6) backward + step
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            epoch_recon += recon_loss.item()
+            epoch_vq    += vq_loss.item()
+            epoch_total += loss.item()
+            num_batches += 1
+
+        # logging
+        print(f"Epoch {epoch:3d}  ∘  Recon={epoch_recon/num_batches:.4f}"
+              f"  VQ={epoch_vq/num_batches:.4f}"
+              f"  Total={epoch_total/num_batches:.4f}")
+
+    # return trained model
+    return vae
+
+if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    trained_vae = train_vae(device)
