@@ -105,7 +105,7 @@ class PongDataset(IterableDataset):
             yield torch.stack(batch, dim=0)  # [32,3,H,W] uint8
 
 # ------------------
-# 3) Training + Live Display via Matplotlib
+# 3) Training + Live Display via Matplotlib (with VQ-ViT)
 # ------------------
 def train_and_display(device, vis_interval=50):
     # 1) fill replay buffer
@@ -122,7 +122,7 @@ def train_and_display(device, vis_interval=50):
         num_workers=0
     )
 
-    # 3) lazy-import & build AE
+    # 3) lazy-import & build VQ-ViT AE
     from autoencoder_kl import AutoencoderKL
     model = AutoencoderKL(
         latent_dim     = 256,
@@ -136,24 +136,29 @@ def train_and_display(device, vis_interval=50):
         dec_depth      = 2,
         dec_heads      = 4,
         mlp_ratio      = 4.0,
-        use_variational=False,
+        use_variational=False,   # VQ-VAE
         use_vq         = True,
-        codebook_size= 84,
-        commitment_cost = 0.25
+        codebook_size  = 84,     # your codebook size
+        commitment_cost= 0.25
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     criterion = nn.MSELoss()
     live_env  = PongEnv()
 
-    # 4) Matplotlib interactive setup
+    # codebook and grid dims
+    K = model.vq.codebook_size
+    H, W = live_env.grid_h, live_env.grid_w
+
+    # 4) Matplotlib interactive setup: 1×3 subplot
     plt.ion()
-    fig, axes = plt.subplots(1,2, figsize=(6,3))
-    for ax, title in zip(axes, ('Original','Reconstruction')):
-        ax.set_title(title)
-        ax.axis('off')
-    blank = np.zeros((100,140,3), dtype=np.uint8)
-    im_orig = axes[0].imshow(blank)
-    im_rec  = axes[1].imshow(blank)
+    fig, axes = plt.subplots(1,3, figsize=(9,3))
+    for ax, title in zip(axes, ('Original','Reconstruction','VQ Indices')):
+        ax.set_title(title); ax.axis('off')
+    blank_frame = np.zeros((H*20, W*20, 3), np.uint8)
+    blank_idx   = np.zeros((H, W), np.uint8)
+    im_orig = axes[0].imshow(blank_frame)
+    im_rec  = axes[1].imshow(blank_frame)
+    im_idx  = axes[2].imshow(blank_idx, cmap='tab20', vmin=0, vmax=K-1)
 
     # 5) training loop
     for epoch in range(1, 51):
@@ -161,39 +166,43 @@ def train_and_display(device, vis_interval=50):
         for batch_idx, batch in enumerate(loader, 1):
             x = batch.float().div(255.0).to(device)  # [32,3,100,140]
 
-            # forward + loss
-            recon_batch, vq_loss, _ = model(x)
+            # forward VQ-VAE
+            recon_batch, vq_loss, idx_map = model(x)
             recon_loss = criterion(recon_batch, x)
             loss = recon_loss + vq_loss
 
-            # backward
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
 
             if batch_idx % vis_interval == 0:
-                # original frame
+                #  original frame
                 orig_t = live_env.step(random.choice([0,1]))
                 orig_np = orig_t.permute(1,2,0).cpu().numpy()
 
-                # reconstruction for single frame
+                # reconstruction + idx for single frame
                 inp = orig_t.unsqueeze(0).float().div(255.0).to(device)  # [1,3,H,W]
                 with torch.no_grad():
-                    recon_batch, _, _ = model(inp, sample_posterior=False)
-                # squeeze batch dim
-                rec_tensor = recon_batch.squeeze(0)                     # [3,H,W]
-                rec_np     = rec_tensor.permute(1,2,0).cpu().numpy()*255
-                rec       = rec_np.clip(0,255).astype(np.uint8)
+                    recon_single, vq_single, idx_single = model(inp)
+                # recon_single: [1,3,H,W] → image
+                rec_img = recon_single.squeeze(0).permute(1,2,0).cpu().numpy()
+                rec_img = (rec_img * 255).clip(0,255).astype(np.uint8)
 
+                # idx_single: [1, H*W] → reshape to [H,W]
+                idx_vec = idx_single.squeeze(0).cpu().numpy()
+                idx_mat = idx_vec.reshape(H, W)
+
+                # update displays
                 im_orig.set_data(orig_np)
-                im_rec .set_data(rec)
+                im_rec .set_data(rec_img)
+                im_idx .set_data(idx_mat)
                 fig.canvas.draw()
                 plt.pause(0.001)
 
         avg = running_loss / batch_idx
         print(f"Epoch {epoch:2d}  Recon Loss: {avg:.6f}")
-        torch.save(model.state_dict(), "ae_pong_vit.pth")
+        torch.save(model.state_dict(), "vqvit_pong.pth")
 
     plt.ioff()
     plt.close(fig)

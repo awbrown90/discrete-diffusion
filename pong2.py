@@ -342,7 +342,7 @@ def noisy_sample(seq: torch.LongTensor, frame_size: int) -> torch.LongTensor:
     return frames.view(-1)
 
 # --------------------- main loop ----------------------
-def run(max_steps=50000, lr=1e-3, seed=0):
+def run(max_steps=50000, lr=1e-4, seed=0):
     torch.manual_seed(seed)
     dev   = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = STModel().to(dev)
