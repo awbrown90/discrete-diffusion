@@ -127,16 +127,44 @@ def test_render_loop():
     env = PongEnv(dev, random_miss=False)
 
     cv2.namedWindow('pong', cv2.WINDOW_NORMAL)
+    #from vae import VAE
+    #vae = VAE()
+    #vae.load_state_dict(torch.load("trained_vae_pong_dense.pth", weights_only=True))
+    from autoencoder_kl import AutoencoderKL
+    vqvit = AutoencoderKL(
+        latent_dim     = 256,
+        input_height   = 100,
+        input_width    = 140,
+        patch_size     = 20,
+        enc_dim        = 128,
+        enc_depth      = 2,
+        enc_heads      = 4,
+        dec_dim        = 128,
+        dec_depth      = 2,
+        dec_heads      = 4,
+        mlp_ratio      = 4.0,
+        use_variational=False,
+        use_vq         = True,
+        codebook_size  = 84,
+        commitment_cost= 0.25
+    ).to(dev)
+    vqvit.load_state_dict(torch.load("vqvit_pong.pth"))
+
     while True:
+
         # get the image tensor (3×H×W), convert to H×W×3 numpy
         img_t = env.getState() # torch.Size([3, 100, 140])
-        from vae import VAE
-        vae = VAE()
-        x = img_t.unsqueeze(0)
-        y,_,_ = vae(x)
-        pix = ((y + 1) * 127.5).clamp(0,255).round().to(torch.uint8).squeeze()
+        
+        x = img_t.unsqueeze(0)/255.0
+        recon_single,_,idx = vqvit(x)
+        rec_img = recon_single.squeeze(0).permute(1,2,0).detach().cpu().numpy()
+        img = (rec_img * 255).clip(0,255).astype(np.uint8)
+        #y = vae(x)
+        #print(idx)
+        #pix = ((y + 1)/2 * 255.0).clamp(0,255).round().to(torch.uint8).squeeze()
+        #pix = (y  * 255.0).clamp(0,255).round().to(torch.uint8).squeeze()
         #img = pix.permute(1,2,0).cpu().numpy()         # H×W×3
-        img = img_t.permute(1,2,0).cpu().numpy()         # H×W×3
+        #img = img_t.permute(1,2,0).cpu().numpy()         # H×W×3
 
         cv2.imshow('pong', img)
         key = cv2.waitKey(200) & 0xFF                     # 200 ms per frame
