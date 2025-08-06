@@ -149,6 +149,7 @@ def test_render_loop():
         commitment_cost= 0.25
     ).to(dev)
     vqvit.load_state_dict(torch.load("vqvit_pong.pth"))
+    vqvit.eval()
 
     while True:
 

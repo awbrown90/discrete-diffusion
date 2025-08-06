@@ -172,7 +172,7 @@ class AutoencoderKL(nn.Module):
             )
 
         # final activation
-        self.to_pixels = nn.Tanh()
+        self.to_pixels =  nn.Sigmoid()
         self._init_weights()
 
     def _init_weights(self):
