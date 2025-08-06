@@ -1,193 +1,203 @@
-import math, random
-from tqdm import trange
+import random
 import torch
 import torch.nn as nn
-from vae import VAE
-import numpy as np
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, IterableDataset
+import numpy as np
+import matplotlib.pyplot as plt
 
+# ------------------
+# 1) PongEnv with one-frame miss logic
+# ------------------
 class PongEnv:
-    def __init__(self,
-                 device,
-                 grid_h=5,
-                 grid_w=7,
-                 patch_size=20,
-                 ball_size=5,
-                 random_miss=True):
-        # dynamics state
+    def __init__(self, grid_h=5, grid_w=7, patch_size=20, ball_size=5):
+        self.grid_h, self.grid_w = grid_h, grid_w
+        self.patch_size, self.ball_size = patch_size, ball_size
+        self.reset()
+
+    def reset(self):
         self.r_paddle   = 0
-        self.grid_h     = grid_h
-        self.grid_w     = grid_w
         self.ball_r     = 0
         self.ball_c     = 1
         self.ball_d_c   = 1
         self.ball_d_r   = 1
-        self.ball_idx   = 0
+        self.ball_idx   = 0    # 0..3 corners, 4 means "miss"
         self.reset_flag = False
-        self.miss_counter = 0
-
-        # rendering params
-        self.patch_size = patch_size
-        self.ball_size  = ball_size
-        self.height     = grid_h * patch_size
-        self.width      = grid_w * patch_size
-
-        self.device     = device
-        self.random_miss = random_miss
 
     def render(self):
-        # start with a black canvas
-        img = np.zeros((self.height, self.width, 3), dtype=np.uint8)
-
-        # draw paddle: leftmost column, full patch_height × 5px wide
+        H = self.grid_h * self.patch_size
+        W = self.grid_w * self.patch_size
+        img = np.zeros((H, W, 3), dtype=np.uint8)
+        # paddle (green)
         y0 = self.r_paddle * self.patch_size
-        img[y0:y0 + self.patch_size,
-            0:5] = (0, 255, 0)   # green in RGB
-
-        # draw ball if it’s in “active” state
+        img[y0:y0+self.patch_size, 0:5] = (0,255,0)
+        # ball (red) if not in miss state
         if self.ball_idx != 4:
-            cell_x = self.ball_c * self.patch_size
-            cell_y = self.ball_r * self.patch_size
-
-            # choose corner based on ball_idx:
-            # 0 = up-right, 1 = up-left, 2 = down-right, 3 = down-left
-            if self.ball_idx == 0:
-                px = cell_x + (self.patch_size - self.ball_size)
-                py = cell_y
-            elif self.ball_idx == 1:
-                px = cell_x
-                py = cell_y
-            elif self.ball_idx == 2:
-                px = cell_x + (self.patch_size - self.ball_size)
-                py = cell_y + (self.patch_size - self.ball_size)
-            elif self.ball_idx == 3:
-                px = cell_x
-                py = cell_y + (self.patch_size - self.ball_size)
-
-            img[py:py + self.ball_size,
-                px:px + self.ball_size] = (0, 0, 255)  # blue in RGB
-
-        # convert to torch tensor, channels-first, on the correct device
-        tensor = torch.from_numpy(img)                    # H×W×3 uint8
-        tensor = tensor.permute(2, 0, 1).to(self.device)  # 3×H×W
-        return tensor
-
-    def getState(self):
-        # exactly the same as before, except return the rendered image
-        return self.render()
+            cx = self.ball_c * self.patch_size
+            cy = self.ball_r * self.patch_size
+            offsets = {
+                0: (self.patch_size-self.ball_size, 0),
+                1: (0, 0),
+                2: (self.patch_size-self.ball_size, self.patch_size-self.ball_size),
+                3: (0, self.patch_size-self.ball_size),
+            }
+            dx, dy = offsets[self.ball_idx]
+            img[cy+dy:cy+dy+self.ball_size,
+                cx+dx:cx+dx+self.ball_size] = (0,0,255)
+        return torch.from_numpy(img).permute(2,0,1)  # CHW uint8
 
     def step(self, action: int):
-        # —— identical dynamics to your original code ——
-
-        # apply paddle move
-        if action == 0:          # up
+        # move paddle
+        if action == 0:
             self.r_paddle = max(self.r_paddle - 1, 0)
-        elif action == 1:        # down
+        else:
             self.r_paddle = min(self.r_paddle + 1, self.grid_h - 1)
-
-        # update ball position & detect misses
+        # update ball
         self.ball_c += self.ball_d_c
         self.ball_r += self.ball_d_r
-
+        # left/right bounce + miss detection
         if self.ball_c >= self.grid_w - 1:
             self.ball_d_c = -1
         elif self.ball_c <= 1:
             if self.ball_idx != 4 and self.r_paddle != self.ball_r:
                 self.reset_flag = True
-                self.ball_idx = 4
-                self.miss_counter += 1
+                self.ball_idx   = 4
             self.ball_d_c = 1
-
+        # top/bottom bounce
         if self.ball_r >= self.grid_h - 1:
             self.ball_d_r = -1
         elif self.ball_r <= 0:
             self.ball_d_r = 1
-
-        # set ball_idx based on direction (if not in miss-reset)
-        if not self.reset_flag:
-            if   self.ball_d_c == 1 and self.ball_d_r == -1: self.ball_idx = 0
-            elif self.ball_d_c == -1 and self.ball_d_r == -1: self.ball_idx = 1
-            elif self.ball_d_c == 1 and self.ball_d_r == 1: self.ball_idx = 2
-            elif self.ball_d_c == -1 and self.ball_d_r == 1: self.ball_idx = 3
-        else:
-            # on miss, clear the reset_flag for the next frame
+        # handle one-frame miss
+        if self.reset_flag:
             self.reset_flag = False
-
-        # instead of returning a token vector, render and return the RGB image
+        else:
+            mapping = {(1,-1):0, (-1,-1):1, (1,1):2, (-1,1):3}
+            self.ball_idx = mapping[(self.ball_d_c, self.ball_d_r)]
         return self.render()
 
-    def reset_misses(self):
-        self.miss_counter = 0
+# ------------------
+# 2) ReplayBuffer + Dataset
+# ------------------
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.buffer = []
+        self.cap = capacity
 
-    def get_misses(self):
-        return self.miss_counter
+    def add(self, frame: torch.Tensor):
+        if len(self.buffer) >= self.cap:
+            self.buffer.pop(0)
+        self.buffer.append(frame.cpu())
+
+    def sample(self, batch_size: int):
+        idx = np.random.choice(len(self.buffer), batch_size, replace=False)
+        return [self.buffer[i] for i in idx]
 
 class PongDataset(IterableDataset):
-    def __init__(self, steps_per_epoch=10000):
+    def __init__(self, buffer: ReplayBuffer, steps_per_epoch: int):
         super().__init__()
-        # now `device` is its own parameter
-        self.env   = PongEnv(device=torch.device("cpu"), random_miss=True)
-        self.steps = steps_per_epoch
+        self.buffer = buffer
+        self.steps  = steps_per_epoch
 
     def __iter__(self):
         for _ in range(self.steps):
-            action = random.choice([0,1])
-            img = self.env.step(action)       # already on the right device
-            yield img
+            batch = self.buffer.sample(32)
+            yield torch.stack(batch, dim=0)  # [32,3,H,W] uint8
 
-def train_vae(device):
-    # 1) hyper-parameters
-    batch_size   = 32
-    lr           = 3e-4
-    n_epochs     = 50
-    recon_weight = 1.0      # weight for MSE loss
-    vq_weight    = 1.0      # weight for VQ loss
+# ------------------
+# 3) Training + Live Display via Matplotlib
+# ------------------
+def train_and_display(device, vis_interval=50):
+    # 1) fill replay buffer
+    buf = ReplayBuffer(capacity=5000)
+    data_env = PongEnv()
+    for _ in range(1000):
+        frame = data_env.step(random.choice([0,1]))
+        buf.add(frame)
 
-    # 2) data loader
-    dataset = PongDataset(steps_per_epoch=2000)
-    loader  = DataLoader(dataset, batch_size=batch_size, num_workers=2)
+    # 2) DataLoader
+    loader = DataLoader(
+        PongDataset(buf, steps_per_epoch=2000),
+        batch_size=None,
+        num_workers=0
+    )
 
-    # 3) model, optimizer
-    vae = VAE().to(device)
-    opt = torch.optim.Adam(vae.parameters(), lr=lr)
+    # 3) lazy-import & build AE
+    from autoencoder_kl import AutoencoderKL
+    model = AutoencoderKL(
+        latent_dim     = 256,
+        input_height   = 100,
+        input_width    = 140,
+        patch_size     = 20,
+        enc_dim        = 128,
+        enc_depth      = 2,
+        enc_heads      = 4,
+        dec_dim        = 128,
+        dec_depth      = 2,
+        dec_heads      = 4,
+        mlp_ratio      = 4.0,
+        use_variational=False,
+        use_vq         = True,
+        codebook_size= 84,
+        commitment_cost = 0.25
+    ).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    criterion = nn.MSELoss()
+    live_env  = PongEnv()
 
-    # 4) training loop
-    for epoch in range(1, n_epochs+1):
-        epoch_recon, epoch_vq, epoch_total = 0.0, 0.0, 0.0
-        num_batches = 0
-        for img_cpu in loader:
-            # x: [B,3,H,W], floats in [0,1]
-            # map to [–1,1] as your encode() expects
-            x = img_cpu.to(device, non_blocking=True).float() / 255.0
-            x_in = 2*(x - 0.5)
+    # 4) Matplotlib interactive setup
+    plt.ion()
+    fig, axes = plt.subplots(1,2, figsize=(6,3))
+    for ax, title in zip(axes, ('Original','Reconstruction')):
+        ax.set_title(title)
+        ax.axis('off')
+    blank = np.zeros((100,140,3), dtype=np.uint8)
+    im_orig = axes[0].imshow(blank)
+    im_rec  = axes[1].imshow(blank)
 
-            # forward pass
-            recon, vq_loss, _ = vae(x_in)
-            # recon: [B,3,H,W], in [–1,1] via Tanh
+    # 5) training loop
+    for epoch in range(1, 51):
+        running_loss = 0.0
+        for batch_idx, batch in enumerate(loader, 1):
+            x = batch.float().div(255.0).to(device)  # [32,3,100,140]
 
-            # 5) compute losses
-            recon_loss = F.mse_loss(recon, x_in)
-            loss       = recon_weight * recon_loss + vq_weight * vq_loss
+            # forward + loss
+            recon_batch, vq_loss, _ = model(x)
+            recon_loss = criterion(recon_batch, x)
+            loss = recon_loss + vq_loss
 
-            # 6) backward + step
-            opt.zero_grad()
+            # backward
+            optimizer.zero_grad()
             loss.backward()
-            opt.step()
+            optimizer.step()
+            running_loss += loss.item()
 
-            epoch_recon += recon_loss.item()
-            epoch_vq    += vq_loss.item()
-            epoch_total += loss.item()
-            num_batches += 1
+            if batch_idx % vis_interval == 0:
+                # original frame
+                orig_t = live_env.step(random.choice([0,1]))
+                orig_np = orig_t.permute(1,2,0).cpu().numpy()
 
-        # logging
-        print(f"Epoch {epoch:3d}  ∘  Recon={epoch_recon/num_batches:.4f}"
-              f"  VQ={epoch_vq/num_batches:.4f}"
-              f"  Total={epoch_total/num_batches:.4f}")
+                # reconstruction for single frame
+                inp = orig_t.unsqueeze(0).float().div(255.0).to(device)  # [1,3,H,W]
+                with torch.no_grad():
+                    recon_batch, _, _ = model(inp, sample_posterior=False)
+                # squeeze batch dim
+                rec_tensor = recon_batch.squeeze(0)                     # [3,H,W]
+                rec_np     = rec_tensor.permute(1,2,0).cpu().numpy()*255
+                rec       = rec_np.clip(0,255).astype(np.uint8)
 
-    # return trained model
-    return vae
+                im_orig.set_data(orig_np)
+                im_rec .set_data(rec)
+                fig.canvas.draw()
+                plt.pause(0.001)
+
+        avg = running_loss / batch_idx
+        print(f"Epoch {epoch:2d}  Recon Loss: {avg:.6f}")
+        torch.save(model.state_dict(), "ae_pong_vit.pth")
+
+    plt.ioff()
+    plt.close(fig)
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    trained_vae = train_vae(device)
+    train_and_display(device)
