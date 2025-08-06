@@ -360,9 +360,28 @@ def run(max_steps=50000, lr=1e-4, seed=0):
     dev   = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = STModel().to(dev)
     opt   = torch.optim.AdamW(model.parameters(), lr=lr)
-    _     = load_checkpoint(model, opt, 'pong2_ckpt.pth', dev)
+    #_     = load_checkpoint(model, opt, 'pong2_ckpt.pth', dev)
 
-    writer = SummaryWriter(log_dir='runs/pong_recon')
+    from autoencoder_kl import AutoencoderKL
+    vqvit = AutoencoderKL(
+        latent_dim     = 256,
+        input_height   = 100,
+        input_width    = 140,
+        patch_size     = 20,
+        enc_dim        = 128,
+        enc_depth      = 2,
+        enc_heads      = 4,
+        dec_dim        = 128,
+        dec_depth      = 2,
+        dec_heads      = 4,
+        mlp_ratio      = 4.0,
+        use_variational=False,
+        use_vq         = True,
+        codebook_size  = 84,
+        commitment_cost= 0.25
+    ).to(dev)
+    vqvit.load_state_dict(torch.load("vqvit_pong.pth"))
+    vqvit.eval()
 
     extW  = GRID_H * (GRID_W + 1)
     # start live with two random frames
@@ -423,7 +442,7 @@ def run(max_steps=50000, lr=1e-4, seed=0):
                             logits.view(-1, len(PATTERNS)),
                             tgt.view(-1))
                 opt.zero_grad(); loss.backward(); opt.step()
-                writer.add_scalar('Train/CrossEntropy', loss.item(), step)
+                
             else:
                 loss = torch.tensor(0., device=dev)
 
