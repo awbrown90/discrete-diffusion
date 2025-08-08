@@ -7,7 +7,6 @@ import numpy as np
 import cv2
 from attention import SpatialAxialAttention, TemporalAxialAttention, TimestepEmbedder
 from rotary_embedding_torch import RotaryEmbedding
-from torch.utils.tensorboard import SummaryWriter
 
 # ------------------ CONFIGURABLE GRID DIMENSIONS ------------------
 GRID_H = 5  # number of rows
@@ -282,6 +281,11 @@ def extend_with_action_col(state: torch.Tensor,
     ext = torch.cat([mat, col.unsqueeze(1)], dim=1)
     return ext.view(-1)
 
+def undo_extend_with_action_col(extended_state: torch.Tensor) -> torch.Tensor:
+    extended_state = extended_state.view(GRID_H, GRID_W + 1)
+    original_mat = extended_state[:, :-1]
+    return original_mat.reshape(-1)
+
 # --------------------- model blocks ----------------------
 class SpatioTemporalBlock(nn.Module):
     def __init__(self, d, heads):
@@ -377,7 +381,7 @@ def run(max_steps=50000, lr=1e-4, seed=0):
         mlp_ratio      = 4.0,
         use_variational=False,
         use_vq         = True,
-        codebook_size  = 84,
+        codebook_size  = 85,
         commitment_cost= 0.25
     ).to(dev)
     vqvit.load_state_dict(torch.load("vqvit_pong.pth"))
@@ -401,34 +405,25 @@ def run(max_steps=50000, lr=1e-4, seed=0):
 
     learning, generate, interactive = True, True, False
 
-    # ——— NEW: prepare to collect logs ———
-    log_entries = [] # will hold lines like "step,misses\n"
-
     try:
         for step in range(1, max_steps+1):
-            # ——— NEW: every 250 steps, log + reset ———
-            if step % 200 == 0:
-                log_entries.append(f"{step},{env_test.get_misses()}\n")
-                #env_test.reset_misses()
-                
+        
             action = random.randint(0, len(actions)-1)
 
             current_state = env_train.getState()
             
-            # 1) map transition → new_state
-            #new_state = map_transition(current_state, action)
-            new_state = env_train.step(action)
+            _,_,cur_z = vqvit(current_state.unsqueeze(0)/255.0) # torch.Size([1, 35])
+            cur_z = cur_z.squeeze(0) # torch.Size([35])
+
+            env_train.step(action)
 
             # 2) extend with action col
-            s0_ext = extend_with_action_col(current_state,
+            s0_ext = extend_with_action_col(cur_z,
                                             actions[action],
                                             zero_idx)
             
             # 3) add to buffer
             buffer.add(s0_ext.cpu().numpy())
-
-            # 4) update current_state
-            current_state = new_state
 
             # ——— train once we have enough data ———
             if len(buffer) >= 64 and learning:
@@ -460,10 +455,29 @@ def run(max_steps=50000, lr=1e-4, seed=0):
             if step % 2 == 0:
                 print(f"step {step} | loss {loss.item():.4f} | "
                       f"learning={learning} | interactive={interactive}")
-                left  = to_img(live[0, :extW])
-                right = to_img(live[0, extW:])
-                sep   = np.full((left.shape[0], 10, 3),
-                                128, dtype=np.uint8)
+                #left  = to_img(live[0, :extW])
+                #right = to_img(live[0, extW:])
+
+                #debug decoding vqvit
+                #import pdb; pdb.set_trace()
+                sl = live[0, :extW]
+                sr = live[0, extW:]
+                sl0 = undo_extend_with_action_col(sl)
+                sr0 = undo_extend_with_action_col(sr)
+                codebook = vqvit.vq.codebook
+                #get the float vectors from the codebook
+                sl0_vectors = codebook[sl0]
+                sr0_vectors = codebook[sr0]
+
+                dl0 = vqvit.decode(sl0_vectors)
+                left = dl0.squeeze(0).permute(1,2,0).detach().cpu().numpy()
+                left = (left * 255).clip(0,255).astype(np.uint8)
+
+                dr0 = vqvit.decode(sr0_vectors)
+                right = dr0.squeeze(0).permute(1,2,0).detach().cpu().numpy()
+                right = (right * 255).clip(0,255).astype(np.uint8)
+
+                sep   = np.full((left.shape[0], 10, 3), 128, dtype=np.uint8)
                 vis   = np.hstack([left, sep, right])
                 cv2.imshow('grid(L) | target(R)', vis)
                 key = cv2.waitKey(1) & 0xFF
@@ -480,7 +494,7 @@ def run(max_steps=50000, lr=1e-4, seed=0):
                 elif key == ord('k'):
                     interactive = not interactive
                 elif key == ord('s'):
-                    save_checkpoint(model, opt, step, 'ckpt.pth')
+                    save_checkpoint(model, opt, step, 'pong3_ckpt.pth')
                 elif interactive and key in [82,84,83]:
                     # up/down arrow → pick action manually
                     if key==82:
@@ -517,7 +531,11 @@ def run(max_steps=50000, lr=1e-4, seed=0):
                     #else:
                     action = random.randint(0, len(actions)-1)
                     new_state = env_test.step(action)
-                    state_ext = extend_with_action_col(new_state,
+
+                    _,_,z = vqvit(new_state.unsqueeze(0)/255.0) # torch.Size([1, 35])
+                    z = z.squeeze(0) # torch.Size([35])
+
+                    state_ext = extend_with_action_col(z,
                                             actions[action],
                                             zero_idx)
                     live = torch.cat([
@@ -529,19 +547,10 @@ def run(max_steps=50000, lr=1e-4, seed=0):
     finally:
         cv2.destroyAllWindows()
         # ——— NEW: write out log file at the very end ———
-        save_log = False
         save_model = False
         if save_model:
             save_checkpoint(model, opt, step, 'k.pth')
-        if save_log:
-            if random_mode:
-                file = 'miss_log_rand.txt'
-            else:
-                file = 'miss_log.txt'
-            with open(file, 'w') as f:
-                f.write("step,misses\n")
-                f.writelines(log_entries)
-            print(f"Wrote {len(log_entries)} entries to {file}")
+        
 
 if __name__ == '__main__':
     run()

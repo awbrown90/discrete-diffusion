@@ -138,7 +138,7 @@ def train_and_display(device, vis_interval=50):
         mlp_ratio      = 4.0,
         use_variational=False,   # VQ-VAE
         use_vq         = True,
-        codebook_size  = 84,     # your codebook size
+        codebook_size  = 85,     # your codebook size
         commitment_cost= 0.25
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
